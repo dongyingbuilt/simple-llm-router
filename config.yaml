@@ -1,0 +1,34 @@
+# simple-llm-router configuration
+# Edit at runtime via POST /admin/config, or modify this file and reload.
+
+admin:
+  api_key: "change-me"
+
+providers:
+  - id: openai
+    name: "OpenAI"
+    base_url: "https://api.openai.com/v1"
+    api_key_env: "OPENAI_API_KEY"
+    models:
+      - gpt-4o
+      - gpt-4o-mini
+      - gpt-3.5-turbo
+
+  - id: anthropic
+    name: "Anthropic"
+    base_url: "https://api.anthropic.com/v1"
+    api_key_env: "ANTHROPIC_API_KEY"
+    models:
+      - claude-sonnet-4-20250514
+      - claude-opus-4-20250514
+
+routing:
+  # model alias -> provider routing rule
+  # "model_name": {provider: <id>, upstream_model: <name>}
+  # If not specified, model name is forwarded as-is to the first provider that lists it.
+  rules: {}
+
+  # Fallback order when model not found in a specific provider.
+  fallback_order:
+    - openai
+    - anthropic

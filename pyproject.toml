@@ -1,0 +1,24 @@
+[project]
+name = "simple-llm-router"
+version = "0.1.0"
+description = "A lightweight LLM proxy that routes requests to configurable providers via a standard OpenAI-compatible API."
+requires-python = ">=3.10"
+dependencies = [
+    "fastapi>=0.115",
+    "uvicorn[standard]>=0.34",
+    "httpx>=0.28",
+    "pydantic>=2.0",
+    "pyyaml>=6.0",
+]
+
+[project.optional-dependencies]
+test = ["pytest>=8.0", "pytest-asyncio>=0.24"]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.24",
+]
+
+[project.scripts]
+router = "router:main"
