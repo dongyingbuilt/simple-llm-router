@@ -97,8 +97,6 @@ def _rebuild_index(cfg: AppConfig) -> None:
 def _resolve_api_key(provider: ProviderConfig) -> str:
     """Resolve provider API key from environment."""
     key = os.environ.get(provider.api_key_env, "")
-    if not key:
-        log.warning("Env %s not set for provider %s", provider.api_key_env, provider.id)
     return key
 
 
@@ -144,91 +142,110 @@ def _resolve_provider(cfg: AppConfig, model: str) -> tuple[ProviderConfig, str]:
 # HTTP proxy helpers
 # ---------------------------------------------------------------------------
 
-async def _proxy_request(
+# ---------------------------------------------------------------------------
+# HTTP proxy helpers (framework-agnostic)
+# ---------------------------------------------------------------------------
+
+def _prepare_upstream(
     provider: ProviderConfig,
     path: str,
-    method: str,
-    headers: dict[str, str],
     body: bytes,
     upstream_model: Optional[str] = None,
-) -> Response:
-    """
-    Forward the request to the upstream provider.
-    Returns a FastAPI Response with the upstream's status, headers, and body.
-    """
+) -> tuple[str, dict[str, str], bytes]:
+    """Build upstream URL, headers, and patched body. No FastAPI dependency."""
     api_key = _resolve_api_key(provider)
     upstream_url = f"{provider.base_url.rstrip('/')}/{path.lstrip('/')}"
 
-    # Build upstream headers
     upstream_headers = {
-        "Content-Type": headers.get("Content-Type", "application/json"),
-        "Accept": headers.get("Accept", "application/json"),
+        "Content-Type": "application/json",
+        "Accept": "application/json",
     }
     if api_key:
         upstream_headers["Authorization"] = f"Bearer {api_key}"
 
-    # If upstream_model differs, patch the body
     patched_body = body
     payload = json.loads(body)
     if upstream_model and upstream_model != payload.get("model"):
         payload["model"] = upstream_model
         patched_body = json.dumps(payload).encode()
 
-    # Decide transport: streaming for SSE, blocking for everything else
+    return upstream_url, upstream_headers, patched_body
+
+
+async def _proxy_request(
+    provider: ProviderConfig,
+    path: str,
+    method: str,
+    body: bytes,
+    upstream_model: Optional[str] = None,
+) -> tuple[int, dict[str, str], bytes]:
+    """
+    Forward request to upstream. Returns (status_code, headers, body_bytes).
+    No FastAPI dependency.
+    """
+    url, upstream_headers, patched_body = _prepare_upstream(provider, path, body, upstream_model)
+    payload = json.loads(patched_body)
     is_stream = payload.get("stream", False)
     t0 = time.monotonic()
-    exclude_headers = {"content-encoding", "content-length", "transfer-encoding", "connection"}
 
     if is_stream:
-        async def _stream_gen():
-            async with httpx.AsyncClient(timeout=120.0) as client:
-                async with client.stream(method, upstream_url, headers=upstream_headers, content=patched_body) as resp:
-                    latency_ms = (time.monotonic() - t0) * 1000
-                    log.info(
-                        "proxied %s %s -> provider=%s model=%s status=%d latency=%.0fms",
-                        method,
-                        path,
-                        provider.id,
-                        upstream_model or payload.get("model", "?"),
-                        resp.status_code,
-                        latency_ms,
-                    )
-                    async for chunk in resp.aiter_bytes():
-                        yield chunk
+        full_body = b""
+        status = 200
+        resp_headers: dict[str, str] = {}
+        async with httpx.AsyncClient(timeout=120.0) as client:
+            async with client.stream(method, url, headers=upstream_headers, content=patched_body) as resp:
+                status = resp.status_code
+                resp_headers = dict(resp.headers)
+                latency_ms = (time.monotonic() - t0) * 1000
+                log.info(
+                    "proxied %s %s -> provider=%s model=%s status=%d latency=%.0fms",
+                    method, path, provider.id,
+                    upstream_model or payload.get("model", "?"),
+                    status, latency_ms,
+                )
+                async for chunk in resp.aiter_bytes():
+                    full_body += chunk
+        return status, resp_headers, full_body
 
-        return StreamingResponse(
-            _stream_gen(),
-            status_code=200,
-            media_type="text/event-stream",
-        )
-
-    # Non-streaming: read full response, then return
     async with httpx.AsyncClient(timeout=120.0) as client:
         resp = await client.request(
-            method=method,
-            url=upstream_url,
-            headers=upstream_headers,
-            content=patched_body,
+            method=method, url=url, headers=upstream_headers, content=patched_body,
         )
-
     latency_ms = (time.monotonic() - t0) * 1000
     log.info(
         "proxied %s %s -> provider=%s model=%s status=%d latency=%.0fms",
-        method,
-        path,
-        provider.id,
+        method, path, provider.id,
         upstream_model or payload.get("model", "?"),
-        resp.status_code,
-        latency_ms,
+        resp.status_code, latency_ms,
     )
-
+    exclude_headers = {"content-encoding", "content-length", "transfer-encoding", "connection"}
     resp_headers = {k: v for k, v in resp.headers.items() if k.lower() not in exclude_headers}
+    return resp.status_code, resp_headers, resp.content
 
-    return Response(
-        content=resp.content,
-        status_code=resp.status_code,
-        headers=resp_headers,
-    )
+
+async def _proxy_request_stream(
+    provider: ProviderConfig,
+    path: str,
+    method: str,
+    body: bytes,
+    upstream_model: Optional[str] = None,
+):
+    """Async generator yielding raw SSE bytes. No FastAPI dependency."""
+    url, upstream_headers, patched_body = _prepare_upstream(provider, path, body, upstream_model)
+    payload = json.loads(patched_body)
+    t0 = time.monotonic()
+
+    async with httpx.AsyncClient(timeout=120.0) as client:
+        async with client.stream(method, url, headers=upstream_headers, content=patched_body) as resp:
+            latency_ms = (time.monotonic() - t0) * 1000
+            log.info(
+                "proxied %s %s -> provider=%s model=%s status=%d latency=%.0fms",
+                method, path, provider.id,
+                upstream_model or payload.get("model", "?"),
+                resp.status_code, latency_ms,
+            )
+            async for chunk in resp.aiter_bytes():
+                yield chunk
 
 
 # ---------------------------------------------------------------------------
@@ -359,7 +376,7 @@ async def list_models():
 @app.post("/chat/completions")
 async def chat_completions(
     request: Request,
-    authorization: Optional[str] = Header(None),
+    authorization: str | None = Header(None),
 ):
     """Proxy chat completion request to upstream provider."""
     body = await request.body()
@@ -370,20 +387,21 @@ async def chat_completions(
         raise HTTPException(status_code=400, detail="'model' field is required")
 
     provider, upstream_model = _resolve_provider(config, model)
-    path = "chat/completions"
 
-    headers = dict(request.headers)
-    if authorization:
-        headers["Authorization"] = authorization
-
-    return await _proxy_request(provider, path, "POST", headers, body, upstream_model)
+    if payload.get("stream", False):
+        return StreamingResponse(
+            _proxy_request_stream(provider, "chat/completions", "POST", body, upstream_model),
+            media_type="text/event-stream",
+        )
+    status, resp_headers, resp_body = await _proxy_request(provider, "chat/completions", "POST", body, upstream_model)
+    return Response(content=resp_body, status_code=status, headers=resp_headers)
 
 
 @app.post("/v1/completions")
 @app.post("/completions")
 async def completions(
     request: Request,
-    authorization: Optional[str] = Header(None),
+    authorization: str | None = Header(None),
 ):
     """Proxy legacy completion request to upstream provider."""
     body = await request.body()
@@ -394,13 +412,14 @@ async def completions(
         raise HTTPException(status_code=400, detail="'model' field is required")
 
     provider, upstream_model = _resolve_provider(config, model)
-    path = "completions"
 
-    headers = dict(request.headers)
-    if authorization:
-        headers["Authorization"] = authorization
-
-    return await _proxy_request(provider, path, "POST", headers, body, upstream_model)
+    if payload.get("stream", False):
+        return StreamingResponse(
+            _proxy_request_stream(provider, "completions", "POST", body, upstream_model),
+            media_type="text/event-stream",
+        )
+    status, resp_headers, resp_body = await _proxy_request(provider, "completions", "POST", body, upstream_model)
+    return Response(content=resp_body, status_code=status, headers=resp_headers)
 
 
 # Catch-all: forward any /v1/... or /... path
@@ -408,7 +427,7 @@ async def completions(
 async def catch_all_proxy(
     request: Request,
     path: str,
-    authorization: Optional[str] = Header(None),
+    authorization: str | None = Header(None),
 ):
     """
     Catch-all proxy: forward unrecognized paths to the first configured provider.
@@ -433,11 +452,13 @@ async def catch_all_proxy(
     else:
         raise HTTPException(status_code=503, detail="No providers configured")
 
-    headers = dict(request.headers)
-    if authorization:
-        headers["Authorization"] = authorization
-
-    return await _proxy_request(provider, path, request.method, headers, body, upstream_model or None)
+    if payload.get("stream", False):
+        return StreamingResponse(
+            _proxy_request_stream(provider, path, request.method, body, upstream_model or None),
+            media_type="text/event-stream",
+        )
+    status, resp_headers, resp_body = await _proxy_request(provider, path, request.method, body, upstream_model or None)
+    return Response(content=resp_body, status_code=status, headers=resp_headers)
 
 
 # ---------------------------------------------------------------------------
@@ -472,29 +493,83 @@ def _cli_chat(config_path: Path, model: str | None, message: str) -> None:
     payload = {
         "model": upstream_model,
         "messages": [{"role": "user", "content": message}],
+        "stream": True,
     }
     body = json.dumps(payload).encode()
-    headers = {
-        "Content-Type": "application/json",
-        "Accept": "application/json",
-    }
 
     print(f"model={model} provider={provider.id}", file=sys.stderr)
 
     async def _run() -> None:
-        resp = await _proxy_request(provider, "chat/completions", "POST", headers, body, upstream_model)
-        if isinstance(resp, StreamingResponse):
-            async for chunk in resp.body_iterator:
-                data = chunk.encode() if isinstance(chunk, str) else bytes(chunk)
-                sys.stdout.buffer.write(data)
-                sys.stdout.buffer.flush()
-            sys.stdout.write("\n")
-        else:
-            raw = resp.body if isinstance(resp.body, bytes) else bytes(resp.body)
-            data = json.loads(raw)
-            choice = data.get("choices", [{}])[0]
-            message = choice.get("message", {})
-            print(message.get("content", "(empty response)"))
+        reasoning_started = False
+        reasoning_ended = False
+
+        def _flush_reasoning() -> None:
+            nonlocal reasoning_started, reasoning_ended
+            if reasoning_started and not reasoning_ended:
+                sys.stdout.write("[/thinking]\n")
+                sys.stdout.flush()
+                reasoning_ended = True
+
+        def _emit(delta: dict) -> None:
+            nonlocal reasoning_started, reasoning_ended
+            reasoning = delta.get("reasoning_content", "")
+            if reasoning:
+                if not reasoning_started:
+                    sys.stdout.write("\n[thinking] ")
+                    sys.stdout.flush()
+                    reasoning_started = True
+                sys.stdout.write(reasoning)
+                sys.stdout.flush()
+            content = delta.get("content", "")
+            if content:
+                _flush_reasoning()
+                sys.stdout.write(content)
+                sys.stdout.flush()
+
+        buffer = b""
+        error_status = None
+        try:
+            async for chunk in _proxy_request_stream(
+                provider, "chat/completions", "POST", body, upstream_model
+            ):
+                buffer += chunk
+                while b"\n" in buffer:
+                    line, buffer = buffer.split(b"\n", 1)
+                    line_str = line.decode("utf-8", errors="replace").strip()
+                    if not line_str or not line_str.startswith("data: "):
+                        continue
+                    data_str = line_str[6:]
+                    if data_str == "[DONE]":
+                        _flush_reasoning()
+                        print()
+                        return
+                    try:
+                        data = json.loads(data_str)
+                        if "error" in data:
+                            error_status = 400
+                            print(f"Error: {data['error']}", file=sys.stderr)
+                            return
+                        delta = data.get("choices", [{}])[0].get("delta", {})
+                        _emit(delta)
+                    except (json.JSONDecodeError, IndexError, KeyError):
+                        pass
+            # Draining leftover buffer
+            if buffer.strip():
+                line_str = buffer.decode("utf-8", errors="replace").strip()
+                if line_str.startswith("data: "):
+                    data_str = line_str[6:]
+                    if data_str != "[DONE]":
+                        try:
+                            data = json.loads(data_str)
+                            delta = data.get("choices", [{}])[0].get("delta", {})
+                            _emit(delta)
+                        except (json.JSONDecodeError, IndexError, KeyError):
+                            pass
+            _flush_reasoning()
+            print()
+        except httpx.HTTPStatusError as e:
+            print(f"HTTP {e.response.status_code}: {e.response.text}", file=sys.stderr)
+            sys.exit(1)
 
     asyncio.run(_run())
 
