@@ -62,7 +62,7 @@ class AppConfig(BaseModel):
 # Config loader / store (in-memory, hot-reloadable via admin API)
 # ---------------------------------------------------------------------------
 
-CONFIG_PATH = Path(__file__).parent / "config.yaml"
+CONFIG_PATH = Path(os.environ.get("ROUTER_CONFIG", str(Path(__file__).parent / "config.yaml")))
 
 
 def _load_config(path: Path = CONFIG_PATH) -> AppConfig:
@@ -104,6 +104,18 @@ def _resolve_api_key(provider: ProviderConfig) -> str:
 # Routing logic
 # ---------------------------------------------------------------------------
 
+def _resolve_default_model(cfg: AppConfig) -> tuple[ProviderConfig, str]:
+    """Resolve 'default' to the first provider in fallback_order and its first model."""
+    for pid in cfg.routing.fallback_order:
+        provider = _id_to_provider.get(pid)
+        if provider and provider.models:
+            return provider, provider.models[0]
+    raise HTTPException(
+        status_code=404,
+        detail="No default model: fallback_order is empty or has no models",
+    )
+
+
 def _resolve_provider(cfg: AppConfig, model: str) -> tuple[ProviderConfig, str]:
     """
     Given a model name, find which provider to route to and what upstream
@@ -112,6 +124,10 @@ def _resolve_provider(cfg: AppConfig, model: str) -> tuple[ProviderConfig, str]:
     Returns (provider_config, upstream_model).
     Raises HTTPException(404) if no provider found.
     """
+    # 0. 'default' resolves to first provider in fallback_order
+    if model == "default":
+        return _resolve_default_model(cfg)
+
     # 1. Check explicit routing rules
     if model in cfg.routing.rules:
         rule = cfg.routing.rules[model]
@@ -254,13 +270,21 @@ async def _proxy_request_stream(
 
 # Global config — reloaded via admin API
 config: AppConfig = _load_config()
+_config_path: Path = CONFIG_PATH
 
 
 # --- Lifespan ---
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    log.info("Config: %s", _config_path.resolve())
     log.info("Loaded %d provider(s): %s", len(config.providers), [p.id for p in config.providers])
+    for p in config.providers:
+        log.info("  provider %s (%s): %s — models: %s", p.id, p.name, p.base_url, p.models)
+    if config.routing.rules:
+        log.info("Routing rules: %s", config.routing.rules)
+    if config.routing.fallback_order:
+        log.info("Fallback order: %s", config.routing.fallback_order)
     yield
 
 
@@ -306,8 +330,10 @@ async def update_config(
 ):
     """Update runtime configuration. Changes take effect immediately."""
     _check_admin_key(authorization)
-    global config
+    global config, _config_path
     config = AppConfig(**new_config)
+    _config_path = Path("<admin API>")
+    _rebuild_index(config)
     log.info("Config updated via admin API")
     return {"status": "ok", "message": "configuration updated"}
 
@@ -381,10 +407,7 @@ async def chat_completions(
     """Proxy chat completion request to upstream provider."""
     body = await request.body()
     payload = json.loads(body)
-    model = payload.get("model", "")
-
-    if not model:
-        raise HTTPException(status_code=400, detail="'model' field is required")
+    model = payload.get("model", "default")
 
     provider, upstream_model = _resolve_provider(config, model)
 
@@ -406,10 +429,7 @@ async def completions(
     """Proxy legacy completion request to upstream provider."""
     body = await request.body()
     payload = json.loads(body)
-    model = payload.get("model", "")
-
-    if not model:
-        raise HTTPException(status_code=400, detail="'model' field is required")
+    model = payload.get("model", "default")
 
     provider, upstream_model = _resolve_provider(config, model)
 
@@ -475,15 +495,15 @@ def _cli_chat(config_path: Path, model: str | None, message: str) -> None:
     # Rebuild global index so _resolve_provider works
     _rebuild_index(cfg)
 
-    # Resolve model: explicit > first in first provider > first fallback
+    # Resolve model: explicit > first provider in fallback_order > first provider
     if not model:
-        if cfg.providers:
-            model = cfg.providers[0].models[0] if cfg.providers[0].models else None
-        if not model and cfg.routing.fallback_order:
+        if cfg.routing.fallback_order:
             fallback_id = cfg.routing.fallback_order[0]
             p = _id_to_provider.get(fallback_id)
             if p and p.models:
                 model = p.models[0]
+        if not model and cfg.providers:
+            model = cfg.providers[0].models[0] if cfg.providers[0].models else None
         if not model:
             print("No default model available. Use -p to specify one.", file=sys.stderr)
             sys.exit(1)
@@ -605,11 +625,9 @@ def main():
     if args.message:
         _cli_chat(Path(args.config), args.provider, args.message)
     else:
-        # Reload config if -c specified (module-level default is CONFIG_PATH)
-        global config
+        # Export config path via env var so uvicorn subprocess picks it up
         custom_config = Path(args.config)
-        if custom_config != CONFIG_PATH:
-            config = _load_config(custom_config)
+        os.environ["ROUTER_CONFIG"] = str(custom_config)
         import uvicorn
         uvicorn.run(
             "router:app",

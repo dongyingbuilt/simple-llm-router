@@ -79,9 +79,12 @@ def test_chat_completions_proxy(client, monkeypatch):
     async def fake_request(*args, **kwargs):
         mock_resp = AsyncMock()
         mock_resp.status_code = 200
-        mock_resp.content = json.dumps({"id": "chat-1", "choices": []}).encode()
+        mock_resp.content = json.dumps({
+            "id": "chat-1",
+            "choices": [{"index": 0, "message": {"role": "assistant", "content": "Hello"}}],
+        }).encode()
         mock_resp.headers = {"content-type": "application/json"}
-        mock_resp.aiter_bytes = lambda: iter([json.dumps({"id": "chat-1", "choices": []}).encode()])
+        mock_resp.aiter_bytes = lambda: iter([mock_resp.content])
         return mock_resp
 
     with patch("httpx.AsyncClient.request", side_effect=fake_request):
@@ -89,13 +92,146 @@ def test_chat_completions_proxy(client, monkeypatch):
         resp = client.post("/v1/chat/completions", json=body)
 
     assert resp.status_code == 200
+    data = resp.json()
+    assert data["choices"][0]["message"]["content"] == "Hello"
 
 
-def test_chat_completions_missing_model(client):
-    body = {"messages": [{"role": "user", "content": "hi"}]}
-    resp = client.post("/v1/chat/completions", json=body)
-    assert resp.status_code == 400
-    assert "model" in resp.json()["detail"].lower()
+def test_chat_completions_streaming(client, monkeypatch):
+    """POST /v1/chat/completions with stream=true should return SSE."""
+    monkeypatch.setenv("TEST_API_KEY", "sk-test123")
+
+    sse_chunks = [
+        b'data: {"choices": [{"index": 0, "delta": {"role": "assistant"}}]}\n\n',
+        b'data: {"choices": [{"index": 0, "delta": {"content": "Hello"}}]}\n\n',
+        b'data: {"choices": [{"index": 0, "delta": {"reasoning_content": "thinking"}}]}\n\n',
+        b'data: {"choices": [{"index": 0, "delta": {"content": " World"}}]}\n\n',
+        b'data: [DONE]\n\n',
+    ]
+
+    class FakeStream:
+        status_code = 200
+        headers = {"content-type": "text/event-stream"}
+
+        async def aiter_bytes(self):
+            for c in sse_chunks:
+                yield c
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            pass
+
+    class FakeClient:
+        def __init__(self, **kw):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            pass
+
+        def stream(self, *a, **kw):
+            return FakeStream()
+
+    with patch("httpx.AsyncClient", side_effect=FakeClient):
+        body = {
+            "model": "test-model",
+            "messages": [{"role": "user", "content": "hi"}],
+            "stream": True,
+        }
+        resp = client.post("/v1/chat/completions", json=body)
+
+    assert resp.status_code == 200
+    assert "text/event-stream" in resp.headers["content-type"]
+    text = resp.text
+    # All chunks should be present in the streamed response
+    assert '"content": "Hello"' in text
+    assert '"content": " World"' in text
+    assert '"reasoning_content": "thinking"' in text
+    assert "[DONE]" in text
+
+
+def test_chat_completions_nonstream_reasoning(client, monkeypatch):
+    """Non-streaming response with reasoning_content should pass through."""
+    monkeypatch.setenv("TEST_API_KEY", "sk-test123")
+
+    async def fake_request(*args, **kwargs):
+        mock_resp = AsyncMock()
+        mock_resp.status_code = 200
+        mock_resp.content = json.dumps({
+            "id": "chat-1",
+            "choices": [{
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": "Answer",
+                    "reasoning_content": "Let me think",
+                },
+            }],
+        }).encode()
+        mock_resp.headers = {"content-type": "application/json"}
+        mock_resp.aiter_bytes = lambda: iter([mock_resp.content])
+        return mock_resp
+
+    with patch("httpx.AsyncClient.request", side_effect=fake_request):
+        body = {"model": "test-model", "messages": [{"role": "user", "content": "hi"}]}
+        resp = client.post("/v1/chat/completions", json=body)
+
+    assert resp.status_code == 200
+    data = resp.json()
+    msg = data["choices"][0]["message"]
+    assert msg["content"] == "Answer"
+    assert msg["reasoning_content"] == "Let me think"
+
+
+def test_chat_completions_missing_model_uses_default(client, monkeypatch):
+    """When model is missing, 'default' is used, resolving to first fallback provider's first model."""
+    monkeypatch.setenv("TEST_API_KEY", "sk-test123")
+
+    async def fake_request(*args, **kwargs):
+        mock_resp = AsyncMock()
+        mock_resp.status_code = 200
+        mock_resp.content = json.dumps({
+            "id": "chat-1",
+            "choices": [{"index": 0, "message": {"role": "assistant", "content": "Hello"}}],
+        }).encode()
+        mock_resp.headers = {"content-type": "application/json"}
+        mock_resp.aiter_bytes = lambda: iter([mock_resp.content])
+        return mock_resp
+
+    with patch("httpx.AsyncClient.request", side_effect=fake_request):
+        body = {"messages": [{"role": "user", "content": "hi"}]}
+        resp = client.post("/v1/chat/completions", json=body)
+
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["choices"][0]["message"]["content"] == "Hello"
+
+
+def test_chat_completions_explicit_default_model(client, monkeypatch):
+    """Explicit model='default' resolves to fallback_order first provider's first model."""
+    monkeypatch.setenv("TEST_API_KEY", "sk-test123")
+
+    async def fake_request(*args, **kwargs):
+        mock_resp = AsyncMock()
+        mock_resp.status_code = 200
+        mock_resp.content = json.dumps({
+            "id": "chat-1",
+            "choices": [{"index": 0, "message": {"role": "assistant", "content": "Hello"}}],
+        }).encode()
+        mock_resp.headers = {"content-type": "application/json"}
+        mock_resp.aiter_bytes = lambda: iter([mock_resp.content])
+        return mock_resp
+
+    with patch("httpx.AsyncClient.request", side_effect=fake_request):
+        body = {"model": "default", "messages": [{"role": "user", "content": "hi"}]}
+        resp = client.post("/v1/chat/completions", json=body)
+
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["choices"][0]["message"]["content"] == "Hello"
 
 
 def test_chat_completions_unknown_model(client):
@@ -233,3 +369,42 @@ def test_resolve_provider_fallback():
     provider, model = router._resolve_provider(cfg, "unknown")
     assert provider.id == "p1"
     assert model == "unknown"
+
+
+def test_resolve_default_model():
+    """model='default' resolves to first provider in fallback_order and its first model."""
+    cfg = router.AppConfig(
+        providers=[
+            router.ProviderConfig(
+                id="p1", name="P1", base_url="https://p1.com",
+                api_key_env="K1", models=["m1", "m2"],
+            ),
+            router.ProviderConfig(
+                id="p2", name="P2", base_url="https://p2.com",
+                api_key_env="K2", models=["m3"],
+            ),
+        ],
+        routing=router.RoutingConfig(fallback_order=["p2", "p1"]),
+    )
+    router._rebuild_index(cfg)
+    provider, model = router._resolve_provider(cfg, "default")
+    # Should resolve to p2 (first in fallback_order) and its first model m3
+    assert provider.id == "p2"
+    assert model == "m3"
+
+
+def test_resolve_default_model_empty_fallback():
+    """model='default' with empty fallback_order raises 404."""
+    cfg = router.AppConfig(
+        providers=[
+            router.ProviderConfig(
+                id="p1", name="P1", base_url="https://p1.com",
+                api_key_env="K1", models=["m1"],
+            ),
+        ],
+        routing=router.RoutingConfig(fallback_order=[]),
+    )
+    router._rebuild_index(cfg)
+    from fastapi import HTTPException
+    with pytest.raises(HTTPException, match="No default model"):
+        router._resolve_provider(cfg, "default")
