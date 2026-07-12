@@ -486,72 +486,101 @@ async def catch_all_proxy(
 # ---------------------------------------------------------------------------
 
 def _cli_chat(config_path: Path, model: str | None, message: str) -> None:
-    """Load config, resolve model, send message, print response, exit."""
-    import asyncio
+    """Start FastAPI app, call its own API, print response, exit."""
+    import socket
     import sys
+    import threading
+    import uvicorn
 
-    # Load the specified config
-    cfg = _load_config(config_path)
-    # Rebuild global index so _resolve_provider works
-    _rebuild_index(cfg)
+    # Export config path so the app picks it up
+    os.environ["ROUTER_CONFIG"] = str(config_path)
 
-    # Resolve model: explicit > first provider in fallback_order > first provider
-    if not model:
-        if cfg.routing.fallback_order:
-            fallback_id = cfg.routing.fallback_order[0]
-            p = _id_to_provider.get(fallback_id)
-            if p and p.models:
-                model = p.models[0]
-        if not model and cfg.providers:
-            model = cfg.providers[0].models[0] if cfg.providers[0].models else None
-        if not model:
-            print("No default model available. Use -p to specify one.", file=sys.stderr)
+    # Reload global config from the specified path
+    global config
+    config = _load_config(config_path)
+    _config_path = config_path
+
+    # Find a free port
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        port = s.getsockname()[1]
+
+    base_url = f"http://127.0.0.1:{port}"
+
+    # Start uvicorn in background thread
+    server = uvicorn.Server(
+        uvicorn.Config(
+            app,
+            host="127.0.0.1",
+            port=port,
+            log_level="warning",
+        )
+    )
+    thread = threading.Thread(target=server.run, daemon=True)
+    thread.start()
+
+    # Wait for server to be ready
+    with httpx.Client(timeout=5.0) as client:
+        for _ in range(60):
+            try:
+                resp = client.get(f"{base_url}/health")
+                if resp.status_code == 200:
+                    break
+            except httpx.ConnectError:
+                pass
+            time.sleep(0.1)
+        else:
+            print("Server startup timeout", file=sys.stderr)
             sys.exit(1)
 
-    provider, upstream_model = _resolve_provider(cfg, model)
+        # Build request — let the API resolve model (default → fallback_order)
+        payload = {
+            "model": model or "default",
+            "messages": [{"role": "user", "content": message}],
+            "stream": True,
+        }
 
-    payload = {
-        "model": upstream_model,
-        "messages": [{"role": "user", "content": message}],
-        "stream": True,
-    }
-    body = json.dumps(payload).encode()
+        resp = client.stream(
+            "POST",
+            f"{base_url}/v1/chat/completions",
+            json=payload,
+            timeout=120.0,
+        )
 
-    print(f"model={model} provider={provider.id}", file=sys.stderr)
+        with resp as r:
+            if r.status_code != 200:
+                print(f"HTTP {r.status_code}: {r.text}", file=sys.stderr)
+                sys.exit(1)
 
-    async def _run() -> None:
-        reasoning_started = False
-        reasoning_ended = False
+            # Parse SSE stream
+            reasoning_started = False
+            reasoning_ended = False
 
-        def _flush_reasoning() -> None:
-            nonlocal reasoning_started, reasoning_ended
-            if reasoning_started and not reasoning_ended:
-                sys.stdout.write("[/thinking]\n")
-                sys.stdout.flush()
-                reasoning_ended = True
-
-        def _emit(delta: dict) -> None:
-            nonlocal reasoning_started, reasoning_ended
-            reasoning = delta.get("reasoning_content", "")
-            if reasoning:
-                if not reasoning_started:
-                    sys.stdout.write("\n[thinking] ")
+            def _flush_reasoning():
+                nonlocal reasoning_started, reasoning_ended
+                if reasoning_started and not reasoning_ended:
+                    sys.stdout.write("[/thinking]\n")
                     sys.stdout.flush()
-                    reasoning_started = True
-                sys.stdout.write(reasoning)
-                sys.stdout.flush()
-            content = delta.get("content", "")
-            if content:
-                _flush_reasoning()
-                sys.stdout.write(content)
-                sys.stdout.flush()
+                    reasoning_ended = True
 
-        buffer = b""
-        error_status = None
-        try:
-            async for chunk in _proxy_request_stream(
-                provider, "chat/completions", "POST", body, upstream_model
-            ):
+            def _emit(delta: dict):
+                nonlocal reasoning_started, reasoning_ended
+                reasoning = delta.get("reasoning_content", "")
+                if reasoning:
+                    if not reasoning_started:
+                        sys.stdout.write("\n[thinking] ")
+                        sys.stdout.flush()
+                        reasoning_started = True
+                    sys.stdout.write(reasoning)
+                    sys.stdout.flush()
+                content = delta.get("content", "")
+                if content:
+                    _flush_reasoning()
+                    sys.stdout.write(content)
+                    sys.stdout.flush()
+
+            buffer = b""
+            for chunk in r.iter_bytes(chunk_size=1024):
                 buffer += chunk
                 while b"\n" in buffer:
                     line, buffer = buffer.split(b"\n", 1)
@@ -562,36 +591,23 @@ def _cli_chat(config_path: Path, model: str | None, message: str) -> None:
                     if data_str == "[DONE]":
                         _flush_reasoning()
                         print()
-                        return
+                        break
                     try:
                         data = json.loads(data_str)
                         if "error" in data:
-                            error_status = 400
                             print(f"Error: {data['error']}", file=sys.stderr)
-                            return
+                            sys.exit(1)
                         delta = data.get("choices", [{}])[0].get("delta", {})
                         _emit(delta)
                     except (json.JSONDecodeError, IndexError, KeyError):
                         pass
-            # Draining leftover buffer
-            if buffer.strip():
-                line_str = buffer.decode("utf-8", errors="replace").strip()
-                if line_str.startswith("data: "):
-                    data_str = line_str[6:]
-                    if data_str != "[DONE]":
-                        try:
-                            data = json.loads(data_str)
-                            delta = data.get("choices", [{}])[0].get("delta", {})
-                            _emit(delta)
-                        except (json.JSONDecodeError, IndexError, KeyError):
-                            pass
+
             _flush_reasoning()
             print()
-        except httpx.HTTPStatusError as e:
-            print(f"HTTP {e.response.status_code}: {e.response.text}", file=sys.stderr)
-            sys.exit(1)
 
-    asyncio.run(_run())
+    # Shutdown
+    server.should_exit = True
+    thread.join(timeout=3)
 
 
 def main():
