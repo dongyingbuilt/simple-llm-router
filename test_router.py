@@ -19,13 +19,12 @@ def _fresh_config(tmp_path):
         providers=[
             router.ProviderConfig(
                 id="test-provider",
-                name="Test",
                 base_url="https://test.example.com/v1",
+                model_name="test-model",
                 api_key_env="TEST_API_KEY",
-                models=["test-model"],
+                tags=["test-tag"],
             ),
         ],
-        routing=router.RoutingConfig(fallback_order=["test-provider"]),
     )
     router.config = cfg
     router._rebuild_index(cfg)
@@ -39,6 +38,11 @@ def client():
 
 @pytest.fixture
 def admin_headers():
+    return {"Authorization": "Bearer test-key"}
+
+
+@pytest.fixture
+def api_headers():
     return {"Authorization": "Bearer test-key"}
 
 
@@ -60,8 +64,10 @@ def test_list_models(client):
     assert resp.status_code == 200
     data = resp.json()
     assert data["object"] == "list"
-    assert len(data["data"]) == 1
-    assert data["data"][0]["id"] == "test-model"
+    # Should have provider id + tags
+    ids = {m["id"] for m in data["data"]}
+    assert "test-provider" in ids
+    assert "test-tag" in ids
     assert data["data"][0]["owned_by"] == "test-provider"
 
 
@@ -72,7 +78,7 @@ def test_list_models_short_path(client):
 
 # --- Chat completions proxy ---
 
-def test_chat_completions_proxy(client, monkeypatch):
+def test_chat_completions_proxy(client, monkeypatch, api_headers):
     """POST /v1/chat/completions should proxy to upstream."""
     monkeypatch.setenv("TEST_API_KEY", "sk-test123")
 
@@ -88,15 +94,15 @@ def test_chat_completions_proxy(client, monkeypatch):
         return mock_resp
 
     with patch("httpx.AsyncClient.request", side_effect=fake_request):
-        body = {"model": "test-model", "messages": [{"role": "user", "content": "hi"}]}
-        resp = client.post("/v1/chat/completions", json=body)
+        body = {"model": "test-provider", "messages": [{"role": "user", "content": "hi"}]}
+        resp = client.post("/v1/chat/completions", json=body, headers=api_headers)
 
     assert resp.status_code == 200
     data = resp.json()
     assert data["choices"][0]["message"]["content"] == "Hello"
 
 
-def test_chat_completions_streaming(client, monkeypatch):
+def test_chat_completions_streaming(client, monkeypatch, api_headers):
     """POST /v1/chat/completions with stream=true should return SSE."""
     monkeypatch.setenv("TEST_API_KEY", "sk-test123")
 
@@ -137,11 +143,11 @@ def test_chat_completions_streaming(client, monkeypatch):
 
     with patch("httpx.AsyncClient", side_effect=FakeClient):
         body = {
-            "model": "test-model",
+            "model": "test-provider",
             "messages": [{"role": "user", "content": "hi"}],
             "stream": True,
         }
-        resp = client.post("/v1/chat/completions", json=body)
+        resp = client.post("/v1/chat/completions", json=body, headers=api_headers)
 
     assert resp.status_code == 200
     assert "text/event-stream" in resp.headers["content-type"]
@@ -153,7 +159,7 @@ def test_chat_completions_streaming(client, monkeypatch):
     assert "[DONE]" in text
 
 
-def test_chat_completions_nonstream_reasoning(client, monkeypatch):
+def test_chat_completions_nonstream_reasoning(client, monkeypatch, api_headers):
     """Non-streaming response with reasoning_content should pass through."""
     monkeypatch.setenv("TEST_API_KEY", "sk-test123")
 
@@ -176,8 +182,8 @@ def test_chat_completions_nonstream_reasoning(client, monkeypatch):
         return mock_resp
 
     with patch("httpx.AsyncClient.request", side_effect=fake_request):
-        body = {"model": "test-model", "messages": [{"role": "user", "content": "hi"}]}
-        resp = client.post("/v1/chat/completions", json=body)
+        body = {"model": "test-provider", "messages": [{"role": "user", "content": "hi"}]}
+        resp = client.post("/v1/chat/completions", json=body, headers=api_headers)
 
     assert resp.status_code == 200
     data = resp.json()
@@ -186,8 +192,8 @@ def test_chat_completions_nonstream_reasoning(client, monkeypatch):
     assert msg["reasoning_content"] == "Let me think"
 
 
-def test_chat_completions_missing_model_uses_default(client, monkeypatch):
-    """When model is missing, 'default' is used, resolving to first fallback provider's first model."""
+def test_chat_completions_missing_model_uses_default(client, monkeypatch, api_headers):
+    """When model is missing, picks first provider."""
     monkeypatch.setenv("TEST_API_KEY", "sk-test123")
 
     async def fake_request(*args, **kwargs):
@@ -203,15 +209,15 @@ def test_chat_completions_missing_model_uses_default(client, monkeypatch):
 
     with patch("httpx.AsyncClient.request", side_effect=fake_request):
         body = {"messages": [{"role": "user", "content": "hi"}]}
-        resp = client.post("/v1/chat/completions", json=body)
+        resp = client.post("/v1/chat/completions", json=body, headers=api_headers)
 
     assert resp.status_code == 200
     data = resp.json()
     assert data["choices"][0]["message"]["content"] == "Hello"
 
 
-def test_chat_completions_explicit_default_model(client, monkeypatch):
-    """Explicit model='default' resolves to fallback_order first provider's first model."""
+def test_chat_completions_explicit_default_model(client, monkeypatch, api_headers):
+    """Explicit model='default' resolves to first provider."""
     monkeypatch.setenv("TEST_API_KEY", "sk-test123")
 
     async def fake_request(*args, **kwargs):
@@ -227,20 +233,43 @@ def test_chat_completions_explicit_default_model(client, monkeypatch):
 
     with patch("httpx.AsyncClient.request", side_effect=fake_request):
         body = {"model": "default", "messages": [{"role": "user", "content": "hi"}]}
-        resp = client.post("/v1/chat/completions", json=body)
+        resp = client.post("/v1/chat/completions", json=body, headers=api_headers)
 
     assert resp.status_code == 200
     data = resp.json()
     assert data["choices"][0]["message"]["content"] == "Hello"
 
 
-def test_chat_completions_unknown_model(client):
-    """unknown model with no fallback should return 404."""
-    # Temporarily clear fallback so unknown model truly 404s
-    router.config.routing.fallback_order = []
+def test_chat_completions_unknown_model(client, api_headers):
+    """unknown model with no matching id or tag should return 404."""
     body = {"model": "unknown-model", "messages": []}
-    resp = client.post("/v1/chat/completions", json=body)
+    resp = client.post("/v1/chat/completions", json=body, headers=api_headers)
     assert resp.status_code == 404
+
+
+def test_chat_completions_no_auth_when_api_key_empty(client, monkeypatch):
+    """When admin api_key is empty, chat completions should not require auth."""
+    monkeypatch.setenv("TEST_API_KEY", "sk-test123")
+    router.config.admin["api_key"] = ""
+
+    async def fake_request(*args, **kwargs):
+        mock_resp = AsyncMock()
+        mock_resp.status_code = 200
+        mock_resp.content = json.dumps({
+            "id": "chat-1",
+            "choices": [{"index": 0, "message": {"role": "assistant", "content": "Hello"}}],
+        }).encode()
+        mock_resp.headers = {"content-type": "application/json"}
+        mock_resp.aiter_bytes = lambda: iter([mock_resp.content])
+        return mock_resp
+
+    with patch("httpx.AsyncClient.request", side_effect=fake_request):
+        body = {"model": "test-provider", "messages": [{"role": "user", "content": "hi"}]}
+        resp = client.post("/v1/chat/completions", json=body)
+
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["choices"][0]["message"]["content"] == "Hello"
 
 
 # --- Admin endpoints ---
@@ -266,10 +295,10 @@ def test_admin_providers_list(client, admin_headers):
 def test_admin_add_provider(client, admin_headers):
     new_provider = {
         "id": "new-provider",
-        "name": "New",
         "base_url": "https://new.example.com/v1",
+        "model_name": "new-model",
         "api_key_env": "NEW_API_KEY",
-        "models": ["new-model"],
+        "tags": ["new-tag"],
     }
     resp = client.post("/admin/providers", json=new_provider, headers=admin_headers)
     assert resp.status_code == 200
@@ -281,10 +310,10 @@ def test_admin_add_provider(client, admin_headers):
 def test_admin_add_provider_duplicate(client, admin_headers):
     new_provider = {
         "id": "test-provider",
-        "name": "Dup",
         "base_url": "https://dup.example.com/v1",
+        "model_name": "dup-model",
         "api_key_env": "DUP_API_KEY",
-        "models": [],
+        "tags": [],
     }
     resp = client.post("/admin/providers", json=new_provider, headers=admin_headers)
     assert resp.status_code == 409
@@ -306,7 +335,6 @@ def test_admin_update_config(client, admin_headers):
     new_cfg = {
         "admin": {"api_key": "new-key"},
         "providers": [],
-        "routing": {"rules": {}, "fallback_order": []},
     }
     resp = client.post("/admin/config", json=new_cfg, headers=admin_headers)
     assert resp.status_code == 200
@@ -315,96 +343,127 @@ def test_admin_update_config(client, admin_headers):
 
 # --- Routing logic ---
 
-def test_resolve_provider_by_model():
+def test_resolve_provider_by_id():
+    """model matching provider id resolves to that provider."""
     cfg = router.AppConfig(
         providers=[
             router.ProviderConfig(
-                id="p1", name="P1", base_url="https://p1.com",
-                api_key_env="K1", models=["m1", "m2"],
+                id="p1", base_url="https://p1.com",
+                model_name="m1", tags=["tag-a"],
             ),
             router.ProviderConfig(
-                id="p2", name="P2", base_url="https://p2.com",
-                api_key_env="K2", models=["m2", "m3"],
+                id="p2", base_url="https://p2.com",
+                model_name="m2", tags=["tag-b"],
             ),
         ],
-        routing=router.RoutingConfig(),
     )
     router._rebuild_index(cfg)
-    # m1 only in p1
-    provider, model = router._resolve_provider(cfg, "m1")
+    provider, model = router._resolve_provider(cfg, "p2")
+    assert provider.id == "p2"
+    assert model == "m2"
+
+
+def test_resolve_provider_by_tag():
+    """model matching a tag resolves to first provider with that tag."""
+    cfg = router.AppConfig(
+        providers=[
+            router.ProviderConfig(
+                id="p1", base_url="https://p1.com",
+                model_name="m1", tags=["tag-a"],
+            ),
+            router.ProviderConfig(
+                id="p2", base_url="https://p2.com",
+                model_name="m2", tags=["tag-a", "tag-b"],
+            ),
+        ],
+    )
+    router._rebuild_index(cfg)
+    # tag-a should resolve to p1 (first in list)
+    provider, model = router._resolve_provider(cfg, "tag-a")
+    assert provider.id == "p1"
+    assert model == "m1"
+    # tag-b should resolve to p2
+    provider, model = router._resolve_provider(cfg, "tag-b")
+    assert provider.id == "p2"
+    assert model == "m2"
+
+
+def test_resolve_provider_default_first():
+    """Empty model or 'default' resolves to first provider."""
+    cfg = router.AppConfig(
+        providers=[
+            router.ProviderConfig(
+                id="p1", base_url="https://p1.com",
+                model_name="m1", tags=[],
+            ),
+            router.ProviderConfig(
+                id="p2", base_url="https://p2.com",
+                model_name="m2", tags=[],
+            ),
+        ],
+    )
+    router._rebuild_index(cfg)
+    provider, model = router._resolve_provider(cfg, "")
+    assert provider.id == "p1"
+    assert model == "m1"
+    provider, model = router._resolve_provider(cfg, "default")
     assert provider.id == "p1"
     assert model == "m1"
 
 
-def test_resolve_provider_with_rule():
-    cfg = router.AppConfig(
-        providers=[
-            router.ProviderConfig(
-                id="p1", name="P1", base_url="https://p1.com",
-                api_key_env="K1", models=["real-model"],
-            ),
-        ],
-        routing=router.RoutingConfig(
-            rules={"alias-model": {"provider": "p1", "upstream_model": "real-model"}},
-        ),
-    )
-    router._rebuild_index(cfg)
-    provider, model = router._resolve_provider(cfg, "alias-model")
-    assert provider.id == "p1"
-    assert model == "real-model"
-
-
-def test_resolve_provider_fallback():
-    cfg = router.AppConfig(
-        providers=[
-            router.ProviderConfig(
-                id="p1", name="P1", base_url="https://p1.com",
-                api_key_env="K1", models=["m1"],
-            ),
-        ],
-        routing=router.RoutingConfig(fallback_order=["p1"]),
-    )
-    router._rebuild_index(cfg)
-    # unknown model falls back to first provider in fallback_order
-    provider, model = router._resolve_provider(cfg, "unknown")
-    assert provider.id == "p1"
-    assert model == "unknown"
-
-
-def test_resolve_default_model():
-    """model='default' resolves to first provider in fallback_order and its first model."""
-    cfg = router.AppConfig(
-        providers=[
-            router.ProviderConfig(
-                id="p1", name="P1", base_url="https://p1.com",
-                api_key_env="K1", models=["m1", "m2"],
-            ),
-            router.ProviderConfig(
-                id="p2", name="P2", base_url="https://p2.com",
-                api_key_env="K2", models=["m3"],
-            ),
-        ],
-        routing=router.RoutingConfig(fallback_order=["p2", "p1"]),
-    )
-    router._rebuild_index(cfg)
-    provider, model = router._resolve_provider(cfg, "default")
-    # Should resolve to p2 (first in fallback_order) and its first model m3
-    assert provider.id == "p2"
-    assert model == "m3"
-
-
-def test_resolve_default_model_empty_fallback():
-    """model='default' with empty fallback_order raises 404."""
-    cfg = router.AppConfig(
-        providers=[
-            router.ProviderConfig(
-                id="p1", name="P1", base_url="https://p1.com",
-                api_key_env="K1", models=["m1"],
-            ),
-        ],
-        routing=router.RoutingConfig(fallback_order=[]),
-    )
+def test_resolve_provider_default_empty_providers():
+    """Empty model with no providers raises 404."""
+    cfg = router.AppConfig(providers=[])
     router._rebuild_index(cfg)
     from fastapi import HTTPException
     with pytest.raises(HTTPException, match="No default model"):
         router._resolve_provider(cfg, "default")
+
+
+def test_resolve_provider_id_over_tag():
+    """Provider id takes priority over tag match."""
+    cfg = router.AppConfig(
+        providers=[
+            router.ProviderConfig(
+                id="tag-a", base_url="https://p1.com",
+                model_name="m1", tags=["tag-b"],
+            ),
+            router.ProviderConfig(
+                id="p2", base_url="https://p2.com",
+                model_name="m2", tags=["tag-a"],
+            ),
+        ],
+    )
+    router._rebuild_index(cfg)
+    # "tag-a" matches provider id first, not tag
+    provider, model = router._resolve_provider(cfg, "tag-a")
+    assert provider.id == "tag-a"
+    assert model == "m1"
+
+
+def test_resolve_provider_unknown():
+    """Unknown model with no matching id or tag raises 404."""
+    cfg = router.AppConfig(
+        providers=[
+            router.ProviderConfig(
+                id="p1", base_url="https://p1.com",
+                model_name="m1", tags=["tag-a"],
+            ),
+        ],
+    )
+    router._rebuild_index(cfg)
+    from fastapi import HTTPException
+    with pytest.raises(HTTPException, match="not found"):
+        router._resolve_provider(cfg, "unknown")
+
+
+# --- Provider with no api_key_env ---
+
+def test_provider_no_api_key():
+    """Provider with no api_key_env returns empty key."""
+    p = router.ProviderConfig(
+        id="p1", base_url="https://p1.com",
+        model_name="m1", tags=[],
+    )
+    assert p.api_key_env is None
+    assert router._resolve_api_key(p) == ""

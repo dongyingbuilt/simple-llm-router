@@ -42,21 +42,15 @@ log = logging.getLogger("router")
 
 class ProviderConfig(BaseModel):
     id: str
-    name: str
     base_url: str
-    api_key_env: str
-    models: list[str] = []
-
-
-class RoutingConfig(BaseModel):
-    rules: dict[str, dict[str, str]] = {}
-    fallback_order: list[str] = []
+    model_name: str
+    tags: list[str] = []
+    api_key_env: Optional[str] = None
 
 
 class AppConfig(BaseModel):
     admin: dict[str, str] = Field(default_factory=lambda: {"api_key": "change-me"})
     providers: list[ProviderConfig] = []
-    routing: RoutingConfig = Field(default_factory=RoutingConfig)
 
 # ---------------------------------------------------------------------------
 # Config loader / store (in-memory, hot-reloadable via admin API)
@@ -79,78 +73,72 @@ def _load_config(path: Path = CONFIG_PATH) -> AppConfig:
 
 
 # Lookup tables — rebuilt on every config change
-_model_to_providers: dict[str, list[str]] = {}
 _id_to_provider: dict[str, ProviderConfig] = {}
+_tag_to_first_provider: dict[str, str] = {}
 
 
 def _rebuild_index(cfg: AppConfig) -> None:
-    """Build model->provider and id->provider lookups."""
-    global _model_to_providers, _id_to_provider
-    _model_to_providers = {}
+    """Build id->provider and tag->first-provider lookups."""
+    global _id_to_provider, _tag_to_first_provider
     _id_to_provider = {}
+    _tag_to_first_provider = {}
     for p in cfg.providers:
         _id_to_provider[p.id] = p
-        for m in p.models:
-            _model_to_providers.setdefault(m, []).append(p.id)
+        for t in p.tags:
+            _tag_to_first_provider.setdefault(t, p.id)
 
 
 def _resolve_api_key(provider: ProviderConfig) -> str:
-    """Resolve provider API key from environment."""
-    key = os.environ.get(provider.api_key_env, "")
-    return key
+    """Resolve provider API key from environment. Empty string if no api_key_env."""
+    if provider.api_key_env is None:
+        return ""
+    return os.environ.get(provider.api_key_env, "")
 
 
 # ---------------------------------------------------------------------------
 # Routing logic
 # ---------------------------------------------------------------------------
 
-def _resolve_default_model(cfg: AppConfig) -> tuple[ProviderConfig, str]:
-    """Resolve 'default' to the first provider in fallback_order and its first model."""
-    for pid in cfg.routing.fallback_order:
-        provider = _id_to_provider.get(pid)
-        if provider and provider.models:
-            return provider, provider.models[0]
-    raise HTTPException(
-        status_code=404,
-        detail="No default model: fallback_order is empty or has no models",
-    )
-
-
 def _resolve_provider(cfg: AppConfig, model: str) -> tuple[ProviderConfig, str]:
     """
     Given a model name, find which provider to route to and what upstream
     model name to use.
 
+    Resolution order:
+    1. No model specified (empty string) → first provider
+    2. model matches a provider id → that provider
+    3. model matches a tag → first provider with that tag
+    4. Otherwise → 404
+
     Returns (provider_config, upstream_model).
     Raises HTTPException(404) if no provider found.
     """
-    # 0. 'default' resolves to first provider in fallback_order
-    if model == "default":
-        return _resolve_default_model(cfg)
+    # 0. No model specified → first provider
+    if not model or model == "default":
+        if not cfg.providers:
+            raise HTTPException(
+                status_code=404,
+                detail="No default model: no providers configured",
+            )
+        provider = cfg.providers[0]
+        return provider, provider.model_name
 
-    # 1. Check explicit routing rules
-    if model in cfg.routing.rules:
-        rule = cfg.routing.rules[model]
-        pid = rule["provider"]
-        upstream = rule.get("upstream_model", model)
-        provider = _id_to_provider.get(pid)
+    # 1. Check provider id
+    provider = _id_to_provider.get(model)
+    if provider:
+        return provider, provider.model_name
+
+    # 2. Check tags
+    tag_provider_id = _tag_to_first_provider.get(model)
+    if tag_provider_id:
+        provider = _id_to_provider.get(tag_provider_id)
         if provider:
-            return provider, upstream
+            return provider, provider.model_name
 
-    # 2. Check model registry
-    provider_ids = _model_to_providers.get(model, [])
-    if provider_ids:
-        return _id_to_provider[provider_ids[0]], model
-
-    # 3. Fallback order
-    for pid in cfg.routing.fallback_order:
-        provider = _id_to_provider.get(pid)
-        if provider:
-            return provider, model
-
+    # 3. Not found
     raise HTTPException(
         status_code=404,
-        detail=f"Model '{model}' not found in any configured provider",
+        detail=f"Model '{model}' not found (no matching provider id or tag)",
     )
 
 
@@ -280,11 +268,7 @@ async def lifespan(app: FastAPI):
     log.info("Config: %s", _config_path.resolve())
     log.info("Loaded %d provider(s): %s", len(config.providers), [p.id for p in config.providers])
     for p in config.providers:
-        log.info("  provider %s (%s): %s — models: %s", p.id, p.name, p.base_url, p.models)
-    if config.routing.rules:
-        log.info("Routing rules: %s", config.routing.rules)
-    if config.routing.fallback_order:
-        log.info("Fallback order: %s", config.routing.fallback_order)
+        log.info("  provider %s: %s (model=%s, tags=%s)", p.id, p.base_url, p.model_name, p.tags)
     yield
 
 
@@ -303,7 +287,7 @@ async def health():
     return {
         "status": "ok",
         "providers": len(config.providers),
-        "models": sum(len(p.models) for p in config.providers),
+        "models": len(config.providers),
     }
 
 
@@ -314,6 +298,19 @@ def _check_admin_key(authorization: str | None) -> None:
     expected = config.admin.get("api_key", "change-me")
     if not authorization or authorization != f"Bearer {expected}":
         raise HTTPException(status_code=401, detail="Admin API key required")
+
+
+def _check_api_key(authorization: str | None) -> None:
+    """Validate API key for OpenAI-compatible endpoints.
+
+    If config admin api_key is empty (or default 'change-me'), skip verification.
+    Otherwise, require Authorization: Bearer <api_key>.
+    """
+    expected = config.admin.get("api_key", "change-me")
+    if not expected:
+        return
+    if not authorization or authorization != f"Bearer {expected}":
+        raise HTTPException(status_code=401, detail="API key required")
 
 
 @app.get("/admin/config")
@@ -386,15 +383,25 @@ async def list_models():
     models = []
     seen = set()
     for p in config.providers:
-        for m in p.models:
-            if m not in seen:
+        # Provider id is always a valid model selector
+        if p.id not in seen:
+            models.append({
+                "id": p.id,
+                "object": "model",
+                "created": 0,
+                "owned_by": p.id,
+            })
+            seen.add(p.id)
+        # Tags are also valid model selectors
+        for t in p.tags:
+            if t not in seen:
                 models.append({
-                    "id": m,
+                    "id": t,
                     "object": "model",
                     "created": 0,
                     "owned_by": p.id,
                 })
-                seen.add(m)
+                seen.add(t)
     return {"object": "list", "data": models}
 
 
@@ -405,6 +412,7 @@ async def chat_completions(
     authorization: str | None = Header(None),
 ):
     """Proxy chat completion request to upstream provider."""
+    _check_api_key(authorization)
     body = await request.body()
     payload = json.loads(body)
     model = payload.get("model", "default")
@@ -427,6 +435,7 @@ async def completions(
     authorization: str | None = Header(None),
 ):
     """Proxy legacy completion request to upstream provider."""
+    _check_api_key(authorization)
     body = await request.body()
     payload = json.loads(body)
     model = payload.get("model", "default")
@@ -453,6 +462,7 @@ async def catch_all_proxy(
     Catch-all proxy: forward unrecognized paths to the first configured provider.
     Useful for endpoints we haven't explicitly defined.
     """
+    _check_api_key(authorization)
     if path.startswith("admin"):
         raise HTTPException(status_code=404, detail=f"Admin endpoint '/{path}' not found")
 
@@ -468,7 +478,7 @@ async def catch_all_proxy(
         provider, upstream_model = _resolve_provider(config, model)
     elif config.providers:
         provider = config.providers[0]
-        upstream_model = model
+        upstream_model = provider.model_name
     else:
         raise HTTPException(status_code=503, detail="No providers configured")
 
