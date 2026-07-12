@@ -9,26 +9,25 @@ providers:
     model_name: "gpt-4o"
     base_url: "https://api.openai.com/v1"
     api_key_env: "OPENAI_API_KEY"
-    tags:
-      - "text"
 
   - id: "openai-gpt4o-mini"
     model_name: "gpt-4o-mini"
     base_url: "https://api.openai.com/v1"
     api_key_env: "OPENAI_API_KEY"
-    tags:
-      - "text"
 
   - id: "anthropic-sonnet"
     model_name: "claude-sonnet-4-20250514"
     base_url: "https://api.anthropic.com/v1"
     api_key_env: "ANTHROPIC_API_KEY"
-    tags:
-      - "text"
 
   - id: "anthropic-opus"
     model_name: "claude-opus-4-20250514"
     base_url: "https://api.anthropic.com/v1"
     api_key_env: "ANTHROPIC_API_KEY"
-    tags:
-      - "text"
+
+tags:
+  text:
+    - "openai-gpt4o"
+    - "openai-gpt4o-mini"
+    - "anthropic-sonnet"
+    - "anthropic-opus"

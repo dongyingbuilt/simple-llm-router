@@ -16,6 +16,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import threading
 import time
 from pathlib import Path
 from typing import Any, Optional
@@ -44,13 +45,14 @@ class ProviderConfig(BaseModel):
     id: str
     base_url: str
     model_name: str
-    tags: list[str] = []
     api_key_env: Optional[str] = None
 
 
 class AppConfig(BaseModel):
-    admin: dict[str, str] = Field(default_factory=lambda: {"api_key": "change-me"})
+    # Defaults to empty api_key
+    admin: dict[str, str] = Field(default_factory=lambda: {"api_key": ""})
     providers: list[ProviderConfig] = []
+    tags: dict[str, list[str]] = Field(default_factory=dict)
 
 # ---------------------------------------------------------------------------
 # Config loader / store (in-memory, hot-reloadable via admin API)
@@ -60,32 +62,123 @@ CONFIG_PATH = Path(os.environ.get("ROUTER_CONFIG", str(Path(__file__).parent / "
 
 
 def _load_config(path: Path = CONFIG_PATH) -> AppConfig:
-    """Load config from YAML file."""
+    """Load config from YAML file with validation."""
     if not path.exists():
         log.warning("Config %s not found, using empty config", path)
         return AppConfig()
     with open(path) as f:
         data = yaml.safe_load(f) or {}
     cfg = AppConfig(**data)
-    # Build lookup tables
+    _validate_config(cfg)
     _rebuild_index(cfg)
     return cfg
 
 
+def _validate_config(cfg: AppConfig) -> None:
+    """Validate config consistency. Raises ValueError on failure."""
+    import re
+    _snake_re = re.compile(r"^[a-z][a-z0-9]*([-_][a-z0-9]+)*$")
+    provider_ids = {p.id for p in cfg.providers}
+
+    # No duplicate provider ids
+    if len(provider_ids) != len(cfg.providers):
+        seen = set()
+        dups = set()
+        for p in cfg.providers:
+            if p.id in seen:
+                dups.add(p.id)
+            seen.add(p.id)
+        raise ValueError(f"Duplicate provider ids: {dups}")
+
+    # Provider id: lowercase snake case, not "default"
+    for p in cfg.providers:
+        if p.id == "default":
+            raise ValueError("Provider id 'default' is reserved")
+        if not _snake_re.match(p.id):
+            raise ValueError(f"Provider id '{p.id}' must be lowercase snake case")
+
+    # No duplicate tag keys
+    if len(cfg.tags) != len(set(cfg.tags.keys())):
+        raise ValueError("Duplicate tag keys in tags section")
+
+    for tag_name, tag_ids in cfg.tags.items():
+        # Tag name: lowercase snake case, not "default"
+        if tag_name == "default":
+            raise ValueError("Tag name 'default' is reserved")
+        if not _snake_re.match(tag_name):
+            raise ValueError(f"Tag name '{tag_name}' must be lowercase snake case")
+
+        # No duplicates within a tag's provider list
+        if len(tag_ids) != len(set(tag_ids)):
+            raise ValueError(f"Duplicate provider ids in tag '{tag_name}'")
+        # All provider ids in tag must exist
+        missing = set(tag_ids) - provider_ids
+        if missing:
+            raise ValueError(f"Tag '{tag_name}' references unknown providers: {missing}")
+
+
 # Lookup tables — rebuilt on every config change
 _id_to_provider: dict[str, ProviderConfig] = {}
-_tag_to_first_provider: dict[str, str] = {}
+_tag_to_providers: dict[str, list[str]] = {}
+
+# Health check state — grouped by base_url
+_url_health: dict[str, bool] = {}  # base_url → healthy?
+_health_lock = threading.Lock()
+_health_stop = threading.Event()
+_health_thread: threading.Thread | None = None
+HEALTH_CHECK_INTERVAL = 60  # seconds
+
+
+def _is_healthy(provider: ProviderConfig) -> bool:
+    """Check if a provider's base_url is currently healthy."""
+    with _health_lock:
+        return _url_health.get(provider.base_url, True)
+
+
+def _run_health_checks() -> None:
+    """Background thread: probe each unique base_url every HEALTH_CHECK_INTERVAL seconds."""
+    while not _health_stop.is_set():
+        # Collect unique base_urls from current config
+        urls = set()
+        for p in config.providers:
+            urls.add(p.base_url)
+
+        for url in urls:
+            probe_url = f"{url.rstrip('/')}/health"
+            try:
+                with httpx.Client(timeout=5.0) as client:
+                    resp = client.get(probe_url)
+                    healthy = resp.status_code == 200
+            except Exception as e:
+                log.debug("Health check failed for %s: %s", probe_url, e)
+                healthy = False
+
+            with _health_lock:
+                old = _url_health.get(url)
+                _url_health[url] = healthy
+                if old is not None and old != healthy:
+                    log.info("Health changed for %s: %s → %s", url, "healthy" if old else "unhealthy", "healthy" if healthy else "unhealthy")
+                elif old is None:
+                    log.info("Health initial for %s: %s", url, "healthy" if healthy else "unhealthy")
+
+        # Sleep in small increments so the stop event is responsive
+        for _ in range(HEALTH_CHECK_INTERVAL):
+            if _health_stop.is_set():
+                break
+            time.sleep(1)
+
+    log.info("Health check thread stopped")
 
 
 def _rebuild_index(cfg: AppConfig) -> None:
-    """Build id->provider and tag->first-provider lookups."""
-    global _id_to_provider, _tag_to_first_provider
+    """Build id->provider and tag->[provider_ids] lookups."""
+    global _id_to_provider, _tag_to_providers
     _id_to_provider = {}
-    _tag_to_first_provider = {}
+    _tag_to_providers = {}
     for p in cfg.providers:
         _id_to_provider[p.id] = p
-        for t in p.tags:
-            _tag_to_first_provider.setdefault(t, p.id)
+    for tag_name, tag_ids in cfg.tags.items():
+        _tag_to_providers[tag_name] = tag_ids
 
 
 def _resolve_api_key(provider: ProviderConfig) -> str:
@@ -105,35 +198,36 @@ def _resolve_provider(cfg: AppConfig, model: str) -> tuple[ProviderConfig, str]:
     model name to use.
 
     Resolution order:
-    1. No model specified (empty string) → first provider
-    2. model matches a provider id → that provider
-    3. model matches a tag → first provider with that tag
+    1. No model specified (empty string) → first healthy provider
+    2. model matches a provider id → that provider (health ignored)
+    3. model matches a tag → first healthy provider with that tag
     4. Otherwise → 404
 
     Returns (provider_config, upstream_model).
     Raises HTTPException(404) if no provider found.
     """
-    # 0. No model specified → first provider
+    # 0. No model specified → first healthy provider
     if not model or model == "default":
-        if not cfg.providers:
-            raise HTTPException(
-                status_code=404,
-                detail="No default model: no providers configured",
-            )
-        provider = cfg.providers[0]
-        return provider, provider.model_name
+        for p in cfg.providers:
+            if _is_healthy(p):
+                return p, p.model_name
+        raise HTTPException(
+            status_code=404,
+            detail="No default model: no healthy providers configured",
+        )
 
-    # 1. Check provider id
+    # 1. Check provider id (explicit selection — health ignored)
     provider = _id_to_provider.get(model)
     if provider:
         return provider, provider.model_name
 
-    # 2. Check tags
-    tag_provider_id = _tag_to_first_provider.get(model)
-    if tag_provider_id:
-        provider = _id_to_provider.get(tag_provider_id)
-        if provider:
-            return provider, provider.model_name
+    # 2. Check tags — first healthy provider with that tag
+    provider_ids = _tag_to_providers.get(model)
+    if provider_ids:
+        for pid in provider_ids:
+            provider = _id_to_provider.get(pid)
+            if provider and _is_healthy(provider):
+                return provider, provider.model_name
 
     # 3. Not found
     raise HTTPException(
@@ -141,10 +235,6 @@ def _resolve_provider(cfg: AppConfig, model: str) -> tuple[ProviderConfig, str]:
         detail=f"Model '{model}' not found (no matching provider id or tag)",
     )
 
-
-# ---------------------------------------------------------------------------
-# HTTP proxy helpers
-# ---------------------------------------------------------------------------
 
 # ---------------------------------------------------------------------------
 # HTTP proxy helpers (framework-agnostic)
@@ -265,11 +355,27 @@ _config_path: Path = CONFIG_PATH
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    global _health_thread
     log.info("Config: %s", _config_path.resolve())
     log.info("Loaded %d provider(s): %s", len(config.providers), [p.id for p in config.providers])
     for p in config.providers:
-        log.info("  provider %s: %s (model=%s, tags=%s)", p.id, p.base_url, p.model_name, p.tags)
+        log.info("  provider %s: %s (model=%s)", p.id, p.base_url, p.model_name)
+    if config.tags:
+        log.info("Tags: %s", list(config.tags.keys()))
+
+    # Start health check background thread
+    _health_stop.clear()
+    _health_thread = threading.Thread(target=_run_health_checks, daemon=True, name="health-check")
+    _health_thread.start()
+    log.info("Health check thread started (interval=%ds)", HEALTH_CHECK_INTERVAL)
+
     yield
+
+    # Stop health check thread
+    _health_stop.set()
+    if _health_thread is not None:
+        _health_thread.join(timeout=HEALTH_CHECK_INTERVAL + 2)
+        _health_thread = None
 
 
 app = FastAPI(
@@ -288,6 +394,7 @@ async def health():
         "status": "ok",
         "providers": len(config.providers),
         "models": len(config.providers),
+        "upstream_health": dict(_url_health),
     }
 
 
@@ -304,7 +411,7 @@ def _check_api_key(authorization: str | None) -> None:
     """Validate API key for OpenAI-compatible endpoints.
 
     If config admin api_key is empty (or default 'change-me'), skip verification.
-    Otherwise, require Authorization: Bearer <api_key>.
+    Otherwise, require Authorization: Bearer ***
     """
     expected = config.admin.get("api_key", "change-me")
     if not expected:
@@ -314,7 +421,7 @@ def _check_api_key(authorization: str | None) -> None:
 
 
 @app.get("/admin/config")
-async def get_config(authorization: Optional[str] = Header(None)):
+async def get_config(authorization: str | None = Header(None)):
     """Get current runtime configuration."""
     _check_admin_key(authorization)
     return config.model_dump()
@@ -323,12 +430,13 @@ async def get_config(authorization: Optional[str] = Header(None)):
 @app.post("/admin/config")
 async def update_config(
     new_config: dict[str, Any],
-    authorization: Optional[str] = Header(None),
+    authorization: str | None = Header(None),
 ):
     """Update runtime configuration. Changes take effect immediately."""
     _check_admin_key(authorization)
     global config, _config_path
     config = AppConfig(**new_config)
+    _validate_config(config)
     _config_path = Path("<admin API>")
     _rebuild_index(config)
     log.info("Config updated via admin API")
@@ -336,10 +444,15 @@ async def update_config(
 
 
 @app.get("/admin/providers")
-async def list_providers(authorization: Optional[str] = Header(None)):
-    """List all configured providers."""
+async def list_providers(authorization: str | None = Header(None)):
+    """List all configured providers with health status."""
     _check_admin_key(authorization)
-    return [p.model_dump() for p in config.providers]
+    result = []
+    for p in config.providers:
+        info = p.model_dump()
+        info["healthy"] = _is_healthy(p)
+        result.append(info)
+    return result
 
 
 @app.post("/admin/providers")
@@ -383,7 +496,6 @@ async def list_models():
     models = []
     seen = set()
     for p in config.providers:
-        # Provider id is always a valid model selector
         if p.id not in seen:
             models.append({
                 "id": p.id,
@@ -392,16 +504,15 @@ async def list_models():
                 "owned_by": p.id,
             })
             seen.add(p.id)
-        # Tags are also valid model selectors
-        for t in p.tags:
-            if t not in seen:
-                models.append({
-                    "id": t,
-                    "object": "model",
-                    "created": 0,
-                    "owned_by": p.id,
-                })
-                seen.add(t)
+    for tag_name in config.tags:
+        if tag_name not in seen:
+            models.append({
+                "id": tag_name,
+                "object": "model",
+                "created": 0,
+                "owned_by": tag_name,
+            })
+            seen.add(tag_name)
     return {"object": "list", "data": models}
 
 

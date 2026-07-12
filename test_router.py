@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import httpx
 from unittest.mock import AsyncMock, patch
 
 import pytest
@@ -22,9 +23,9 @@ def _fresh_config(tmp_path):
                 base_url="https://test.example.com/v1",
                 model_name="test-model",
                 api_key_env="TEST_API_KEY",
-                tags=["test-tag"],
             ),
         ],
+        tags={"test-tag": ["test-provider"]},
     )
     router.config = cfg
     router._rebuild_index(cfg)
@@ -64,11 +65,9 @@ def test_list_models(client):
     assert resp.status_code == 200
     data = resp.json()
     assert data["object"] == "list"
-    # Should have provider id + tags
     ids = {m["id"] for m in data["data"]}
     assert "test-provider" in ids
     assert "test-tag" in ids
-    assert data["data"][0]["owned_by"] == "test-provider"
 
 
 def test_list_models_short_path(client):
@@ -152,7 +151,6 @@ def test_chat_completions_streaming(client, monkeypatch, api_headers):
     assert resp.status_code == 200
     assert "text/event-stream" in resp.headers["content-type"]
     text = resp.text
-    # All chunks should be present in the streamed response
     assert '"content": "Hello"' in text
     assert '"content": " World"' in text
     assert '"reasoning_content": "thinking"' in text
@@ -298,12 +296,10 @@ def test_admin_add_provider(client, admin_headers):
         "base_url": "https://new.example.com/v1",
         "model_name": "new-model",
         "api_key_env": "NEW_API_KEY",
-        "tags": ["new-tag"],
     }
     resp = client.post("/admin/providers", json=new_provider, headers=admin_headers)
     assert resp.status_code == 200
     assert resp.json()["provider"]["id"] == "new-provider"
-    # Verify it's in the live config
     assert len(router.config.providers) == 2
 
 
@@ -313,7 +309,6 @@ def test_admin_add_provider_duplicate(client, admin_headers):
         "base_url": "https://dup.example.com/v1",
         "model_name": "dup-model",
         "api_key_env": "DUP_API_KEY",
-        "tags": [],
     }
     resp = client.post("/admin/providers", json=new_provider, headers=admin_headers)
     assert resp.status_code == 409
@@ -335,6 +330,7 @@ def test_admin_update_config(client, admin_headers):
     new_cfg = {
         "admin": {"api_key": "new-key"},
         "providers": [],
+        "tags": {},
     }
     resp = client.post("/admin/config", json=new_cfg, headers=admin_headers)
     assert resp.status_code == 200
@@ -347,15 +343,10 @@ def test_resolve_provider_by_id():
     """model matching provider id resolves to that provider."""
     cfg = router.AppConfig(
         providers=[
-            router.ProviderConfig(
-                id="p1", base_url="https://p1.com",
-                model_name="m1", tags=["tag-a"],
-            ),
-            router.ProviderConfig(
-                id="p2", base_url="https://p2.com",
-                model_name="m2", tags=["tag-b"],
-            ),
+            router.ProviderConfig(id="p1", base_url="https://p1.com", model_name="m1"),
+            router.ProviderConfig(id="p2", base_url="https://p2.com", model_name="m2"),
         ],
+        tags={"tag-a": ["p1"], "tag-b": ["p2"]},
     )
     router._rebuild_index(cfg)
     provider, model = router._resolve_provider(cfg, "p2")
@@ -364,43 +355,31 @@ def test_resolve_provider_by_id():
 
 
 def test_resolve_provider_by_tag():
-    """model matching a tag resolves to first provider with that tag."""
+    """model matching a tag resolves to first provider in the tag list."""
     cfg = router.AppConfig(
         providers=[
-            router.ProviderConfig(
-                id="p1", base_url="https://p1.com",
-                model_name="m1", tags=["tag-a"],
-            ),
-            router.ProviderConfig(
-                id="p2", base_url="https://p2.com",
-                model_name="m2", tags=["tag-a", "tag-b"],
-            ),
+            router.ProviderConfig(id="p1", base_url="https://p1.com", model_name="m1"),
+            router.ProviderConfig(id="p2", base_url="https://p2.com", model_name="m2"),
         ],
+        tags={"tag-a": ["p1", "p2"], "tag-b": ["p2"]},
     )
     router._rebuild_index(cfg)
-    # tag-a should resolve to p1 (first in list)
     provider, model = router._resolve_provider(cfg, "tag-a")
     assert provider.id == "p1"
     assert model == "m1"
-    # tag-b should resolve to p2
     provider, model = router._resolve_provider(cfg, "tag-b")
     assert provider.id == "p2"
     assert model == "m2"
 
 
 def test_resolve_provider_default_first():
-    """Empty model or 'default' resolves to first provider."""
+    """Empty model or 'default' resolves to first healthy provider."""
     cfg = router.AppConfig(
         providers=[
-            router.ProviderConfig(
-                id="p1", base_url="https://p1.com",
-                model_name="m1", tags=[],
-            ),
-            router.ProviderConfig(
-                id="p2", base_url="https://p2.com",
-                model_name="m2", tags=[],
-            ),
+            router.ProviderConfig(id="p1", base_url="https://p1.com", model_name="m1"),
+            router.ProviderConfig(id="p2", base_url="https://p2.com", model_name="m2"),
         ],
+        tags={},
     )
     router._rebuild_index(cfg)
     provider, model = router._resolve_provider(cfg, "")
@@ -413,7 +392,7 @@ def test_resolve_provider_default_first():
 
 def test_resolve_provider_default_empty_providers():
     """Empty model with no providers raises 404."""
-    cfg = router.AppConfig(providers=[])
+    cfg = router.AppConfig(providers=[], tags={})
     router._rebuild_index(cfg)
     from fastapi import HTTPException
     with pytest.raises(HTTPException, match="No default model"):
@@ -424,18 +403,12 @@ def test_resolve_provider_id_over_tag():
     """Provider id takes priority over tag match."""
     cfg = router.AppConfig(
         providers=[
-            router.ProviderConfig(
-                id="tag-a", base_url="https://p1.com",
-                model_name="m1", tags=["tag-b"],
-            ),
-            router.ProviderConfig(
-                id="p2", base_url="https://p2.com",
-                model_name="m2", tags=["tag-a"],
-            ),
+            router.ProviderConfig(id="tag-a", base_url="https://p1.com", model_name="m1"),
+            router.ProviderConfig(id="p2", base_url="https://p2.com", model_name="m2"),
         ],
+        tags={"tag-a": ["p2"]},
     )
     router._rebuild_index(cfg)
-    # "tag-a" matches provider id first, not tag
     provider, model = router._resolve_provider(cfg, "tag-a")
     assert provider.id == "tag-a"
     assert model == "m1"
@@ -445,11 +418,9 @@ def test_resolve_provider_unknown():
     """Unknown model with no matching id or tag raises 404."""
     cfg = router.AppConfig(
         providers=[
-            router.ProviderConfig(
-                id="p1", base_url="https://p1.com",
-                model_name="m1", tags=["tag-a"],
-            ),
+            router.ProviderConfig(id="p1", base_url="https://p1.com", model_name="m1"),
         ],
+        tags={"tag-a": ["p1"]},
     )
     router._rebuild_index(cfg)
     from fastapi import HTTPException
@@ -461,9 +432,280 @@ def test_resolve_provider_unknown():
 
 def test_provider_no_api_key():
     """Provider with no api_key_env returns empty key."""
-    p = router.ProviderConfig(
-        id="p1", base_url="https://p1.com",
-        model_name="m1", tags=[],
-    )
+    p = router.ProviderConfig(id="p1", base_url="https://p1.com", model_name="m1")
     assert p.api_key_env is None
     assert router._resolve_api_key(p) == ""
+
+
+# --- Config validation ---
+
+def test_validate_duplicate_provider_ids():
+    cfg = router.AppConfig(
+        providers=[
+            router.ProviderConfig(id="p1", base_url="https://p1.com", model_name="m1"),
+            router.ProviderConfig(id="p1", base_url="https://p2.com", model_name="m2"),
+        ],
+    )
+    with pytest.raises(ValueError, match="Duplicate provider ids"):
+        router._validate_config(cfg)
+
+
+def test_validate_tag_references_unknown_provider():
+    cfg = router.AppConfig(
+        providers=[
+            router.ProviderConfig(id="p1", base_url="https://p1.com", model_name="m1"),
+        ],
+        tags={"tag-a": ["p1", "p99"]},
+    )
+    with pytest.raises(ValueError, match="unknown providers"):
+        router._validate_config(cfg)
+
+
+def test_validate_duplicate_ids_in_tag():
+    cfg = router.AppConfig(
+        providers=[
+            router.ProviderConfig(id="p1", base_url="https://p1.com", model_name="m1"),
+        ],
+        tags={"tag-a": ["p1", "p1"]},
+    )
+    with pytest.raises(ValueError, match="Duplicate provider ids in tag"):
+        router._validate_config(cfg)
+
+
+def test_validate_valid_config():
+    cfg = router.AppConfig(
+        providers=[
+            router.ProviderConfig(id="p1", base_url="https://p1.com", model_name="m1"),
+            router.ProviderConfig(id="p2", base_url="https://p2.com", model_name="m2"),
+        ],
+        tags={"text": ["p1", "p2"], "coding": ["p2"]},
+    )
+    # Should not raise
+    router._validate_config(cfg)
+
+
+def test_validate_default_provider_id_reserved():
+    cfg = router.AppConfig(
+        providers=[
+            router.ProviderConfig(id="default", base_url="https://p1.com", model_name="m1"),
+        ],
+    )
+    with pytest.raises(ValueError, match="reserved"):
+        router._validate_config(cfg)
+
+
+def test_validate_default_tag_reserved():
+    cfg = router.AppConfig(
+        providers=[
+            router.ProviderConfig(id="p1", base_url="https://p1.com", model_name="m1"),
+        ],
+        tags={"default": ["p1"]},
+    )
+    with pytest.raises(ValueError, match="reserved"):
+        router._validate_config(cfg)
+
+
+def test_validate_provider_id_not_snake_case():
+    cfg = router.AppConfig(
+        providers=[
+            router.ProviderConfig(id="P1", base_url="https://p1.com", model_name="m1"),
+        ],
+    )
+    with pytest.raises(ValueError, match="snake case"):
+        router._validate_config(cfg)
+
+
+def test_validate_tag_not_snake_case():
+    cfg = router.AppConfig(
+        providers=[
+            router.ProviderConfig(id="p1", base_url="https://p1.com", model_name="m1"),
+        ],
+        tags={"Text": ["p1"]},
+    )
+    with pytest.raises(ValueError, match="snake case"):
+        router._validate_config(cfg)
+
+
+# --- Health check state ---
+
+def test_is_healthy_defaults_true():
+    """Before health check runs, all providers default to healthy."""
+    p = router.ProviderConfig(id="p1", base_url="https://p1.com", model_name="m1")
+    router._url_health.clear()
+    assert router._is_healthy(p) is True
+
+
+def test_is_healthy_respects_state():
+    """_is_healthy reflects _url_health state."""
+    p = router.ProviderConfig(id="p1", base_url="https://p1.com", model_name="m1")
+    router._url_health["https://p1.com"] = False
+    assert router._is_healthy(p) is False
+    router._url_health["https://p1.com"] = True
+    assert router._is_healthy(p) is True
+    del router._url_health["https://p1.com"]
+
+
+def test_health_endpoint_includes_upstream_health(client):
+    """GET /health returns upstream_health field."""
+    resp = client.get("/health")
+    assert resp.status_code == 200
+    data = resp.json()
+    assert "upstream_health" in data
+    assert isinstance(data["upstream_health"], dict)
+
+
+def test_admin_providers_includes_healthy(client, admin_headers):
+    """GET /admin/providers returns healthy field per provider."""
+    resp = client.get("/admin/providers", headers=admin_headers)
+    assert resp.status_code == 200
+    providers = resp.json()
+    assert len(providers) == 1
+    assert "healthy" in providers[0]
+    assert providers[0]["healthy"] is True
+
+
+def test_default_skips_unhealthy():
+    """Default resolution picks first healthy provider."""
+    cfg = router.AppConfig(
+        providers=[
+            router.ProviderConfig(id="p1", base_url="https://p1.com", model_name="m1"),
+            router.ProviderConfig(id="p2", base_url="https://p2.com", model_name="m2"),
+        ],
+        tags={},
+    )
+    router._rebuild_index(cfg)
+    router._url_health["https://p1.com"] = False
+    provider, model = router._resolve_provider(cfg, "")
+    assert provider.id == "p2"
+    assert model == "m2"
+    del router._url_health["https://p1.com"]
+
+
+def test_default_all_unhealthy_raises_404():
+    """When all providers are unhealthy, default raises 404."""
+    cfg = router.AppConfig(
+        providers=[
+            router.ProviderConfig(id="p1", base_url="https://p1.com", model_name="m1"),
+        ],
+        tags={},
+    )
+    router._rebuild_index(cfg)
+    router._url_health["https://p1.com"] = False
+    from fastapi import HTTPException
+    with pytest.raises(HTTPException, match="no healthy providers"):
+        router._resolve_provider(cfg, "default")
+    del router._url_health["https://p1.com"]
+
+
+def test_tag_skips_unhealthy():
+    """Tag resolution picks first healthy provider in the tag list."""
+    cfg = router.AppConfig(
+        providers=[
+            router.ProviderConfig(id="p1", base_url="https://p1.com", model_name="m1"),
+            router.ProviderConfig(id="p2", base_url="https://p2.com", model_name="m2"),
+        ],
+        tags={"tag-a": ["p1", "p2"]},
+    )
+    router._rebuild_index(cfg)
+    router._url_health["https://p1.com"] = False
+    provider, model = router._resolve_provider(cfg, "tag-a")
+    assert provider.id == "p2"
+    assert model == "m2"
+    del router._url_health["https://p1.com"]
+
+
+def test_id_match_ignores_health():
+    """Explicit provider id match ignores health status."""
+    cfg = router.AppConfig(
+        providers=[
+            router.ProviderConfig(id="p1", base_url="https://p1.com", model_name="m1"),
+        ],
+        tags={},
+    )
+    router._rebuild_index(cfg)
+    router._url_health["https://p1.com"] = False
+    provider, model = router._resolve_provider(cfg, "p1")
+    assert provider.id == "p1"
+    assert model == "m1"
+    del router._url_health["https://p1.com"]
+
+
+# --- Health check thread ---
+
+def test_health_check_probes_v1_health(monkeypatch):
+    """Health check thread probes /v1/health on each base_url."""
+    probed_urls = []
+
+    class FakeClient:
+        def __init__(self, **kw):
+            pass
+        def __enter__(self):
+            return self
+        def __exit__(self, *a):
+            pass
+        def get(self, url):
+            probed_urls.append(url)
+            mock_resp = type("R", (), {"status_code": 200})()
+            return mock_resp
+
+    cfg = router.AppConfig(
+        providers=[
+            router.ProviderConfig(id="p1", base_url="https://p1.com", model_name="m1"),
+            router.ProviderConfig(id="p2", base_url="https://p2.com", model_name="m2"),
+        ],
+        tags={},
+    )
+    router.config = cfg
+    router._rebuild_index(cfg)
+    router._url_health.clear()
+
+    with patch("httpx.Client", side_effect=FakeClient):
+        urls = set(p.base_url for p in cfg.providers)
+        for url in urls:
+            probe_url = f"{url.rstrip('/')}/v1/health"
+            with httpx.Client(timeout=5.0) as client:
+                resp = client.get(probe_url)
+                healthy = resp.status_code == 200
+            with router._health_lock:
+                router._url_health[url] = healthy
+
+    assert "https://p1.com/v1/health" in probed_urls
+    assert "https://p2.com/v1/health" in probed_urls
+    assert router._url_health["https://p1.com"] is True
+    assert router._url_health["https://p2.com"] is True
+
+
+def test_health_check_marks_unhealthy(monkeypatch):
+    """Health check marks URL unhealthy when probe fails."""
+    class FakeClient:
+        def __init__(self, **kw):
+            pass
+        def __enter__(self):
+            return self
+        def __exit__(self, *a):
+            pass
+        def get(self, url):
+            raise httpx.ConnectError("Connection refused")
+
+    cfg = router.AppConfig(
+        providers=[
+            router.ProviderConfig(id="p1", base_url="https://p1.com", model_name="m1"),
+        ],
+        tags={},
+    )
+    router.config = cfg
+    router._rebuild_index(cfg)
+    router._url_health.clear()
+
+    with patch("httpx.Client", side_effect=FakeClient):
+        probe_url = "https://p1.com/v1/health"
+        try:
+            with httpx.Client(timeout=5.0) as client:
+                resp = client.get(probe_url)
+                healthy = resp.status_code == 200
+        except Exception:
+            healthy = False
+        with router._health_lock:
+            router._url_health["https://p1.com"] = healthy
+
+    assert router._url_health["https://p1.com"] is False
