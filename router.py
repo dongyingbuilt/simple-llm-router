@@ -13,8 +13,10 @@ Usage:
 from __future__ import annotations
 
 
+import base64
 import json
 import logging
+import mimetypes
 import os
 import threading
 import time
@@ -606,7 +608,7 @@ async def catch_all_proxy(
 # CLI entry
 # ---------------------------------------------------------------------------
 
-def _cli_chat(config_path: Path, model: str | None, message: str) -> None:
+def _cli_chat(config_path: Path, model: str | None, message: str, image_path: str | None = None) -> None:
     """Start FastAPI app, call its own API, print response, exit."""
     import socket
     import sys
@@ -654,10 +656,29 @@ def _cli_chat(config_path: Path, model: str | None, message: str) -> None:
             print("Server startup timeout", file=sys.stderr)
             sys.exit(1)
 
+        # Build request content
+        if image_path:
+            img_file = Path(image_path)
+            if not img_file.exists():
+                print(f"Image not found: {image_path}", file=sys.stderr)
+                sys.exit(1)
+            mime, _ = mimetypes.guess_type(image_path)
+            if not mime:
+                mime = "image/png"
+            raw = img_file.read_bytes()
+            b64 = base64.b64encode(raw).decode("ascii")
+            data_url = f"data:{mime};base64,{b64}"
+            content = [
+                {"type": "text", "text": message},
+                {"type": "image_url", "image_url": {"url": data_url}},
+            ]
+        else:
+            content = message
+
         # Build request — let the API resolve model (default → fallback_order)
         payload = {
             "model": model or "default",
-            "messages": [{"role": "user", "content": message}],
+            "messages": [{"role": "user", "content": content}],
             "stream": True,
         }
 
@@ -757,10 +778,16 @@ def main():
         default=None,
         help="Message to send to the selected model (CLI mode; omit for server mode)",
     )
+    parser.add_argument(
+        "-f", "--file",
+        metavar="IMAGE",
+        default=None,
+        help="Path to an image file to include with the message (CLI mode)",
+    )
     args = parser.parse_args()
 
     if args.message:
-        _cli_chat(Path(args.config), args.provider, args.message)
+        _cli_chat(Path(args.config), args.provider, args.message, args.file)
     else:
         # Export config path via env var so uvicorn subprocess picks it up
         custom_config = Path(args.config)
