@@ -50,12 +50,13 @@ def api_headers():
 # --- Health ---
 
 def test_health(client):
-    resp = client.get("/health")
-    assert resp.status_code == 200
-    data = resp.json()
-    assert data["status"] == "ok"
-    assert data["providers"] == 1
-    assert data["models"] == 1
+    for api_path in ("/v1/health", "/health"):
+        resp = client.get(api_path)
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["status"] == "ok"
+        assert data["providers"] == 1
+        assert data["models"] == 1
 
 
 # --- Models listing ---
@@ -68,11 +69,6 @@ def test_list_models(client):
     ids = {m["id"] for m in data["data"]}
     assert "test-provider" in ids
     assert "test-tag" in ids
-
-
-def test_list_models_short_path(client):
-    resp = client.get("/models")
-    assert resp.status_code == 200
 
 
 # --- Chat completions proxy ---

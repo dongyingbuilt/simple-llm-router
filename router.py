@@ -260,10 +260,13 @@ def _prepare_upstream(
         upstream_headers["Authorization"] = f"Bearer {api_key}"
 
     patched_body = body
-    payload = json.loads(body)
-    if upstream_model and upstream_model != payload.get("model"):
-        payload["model"] = upstream_model
-        patched_body = json.dumps(payload).encode()
+    try:
+        payload = json.loads(body)
+        if upstream_model and upstream_model != payload.get("model"):
+            payload["model"] = upstream_model
+            patched_body = json.dumps(payload).encode()
+    except json.JSONDecodeError:
+        pass
 
     return upstream_url, upstream_headers, patched_body
 
@@ -280,15 +283,21 @@ async def _proxy_request(
     No FastAPI dependency.
     """
     url, upstream_headers, patched_body = _prepare_upstream(provider, path, body, upstream_model)
-    payload = json.loads(patched_body)
-    is_stream = payload.get("stream", False)
+    try:
+      payload = json.loads(patched_body)
+      is_stream = payload.get("stream", False)
+    except json.JSONDecodeError:
+      payload = {} 
+      is_stream = False
+      pass
+
     t0 = time.monotonic()
 
     if is_stream:
         full_body = b""
         status = 200
         resp_headers: dict[str, str] = {}
-        async with httpx.AsyncClient(timeout=120.0) as client:
+        async with httpx.AsyncClient(timeout=1800) as client:
             async with client.stream(method, url, headers=upstream_headers, content=patched_body) as resp:
                 status = resp.status_code
                 resp_headers = dict(resp.headers)
@@ -303,7 +312,7 @@ async def _proxy_request(
                     full_body += chunk
         return status, resp_headers, full_body
 
-    async with httpx.AsyncClient(timeout=120.0) as client:
+    async with httpx.AsyncClient(timeout=1800) as client:
         resp = await client.request(
             method=method, url=url, headers=upstream_headers, content=patched_body,
         )
@@ -382,7 +391,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="simple-llm-router",
-    version="0.1.0",
+    version="0.2.0",
     description="Lightweight LLM provider router with OpenAI-compatible API",
     lifespan=lifespan,
 )
@@ -390,6 +399,7 @@ app = FastAPI(
 
 # --- Health ---
 
+@app.get("/v1/health")
 @app.get("/health")
 async def health():
     return {
@@ -398,7 +408,6 @@ async def health():
         "models": len(config.providers),
         "upstream_health": dict(_url_health),
     }
-
 
 # --- Admin endpoints ---
 
@@ -492,7 +501,6 @@ async def remove_provider(
 # --- OpenAI-compatible endpoints ---
 
 @app.get("/v1/models")
-@app.get("/models")
 async def list_models():
     """List all available models across configured providers."""
     models = []
@@ -519,7 +527,6 @@ async def list_models():
 
 
 @app.post("/v1/chat/completions")
-@app.post("/chat/completions")
 async def chat_completions(
     request: Request,
     authorization: str | None = Header(None),
@@ -542,7 +549,6 @@ async def chat_completions(
 
 
 @app.post("/v1/completions")
-@app.post("/completions")
 async def completions(
     request: Request,
     authorization: str | None = Header(None),
@@ -561,46 +567,6 @@ async def completions(
             media_type="text/event-stream",
         )
     status, resp_headers, resp_body = await _proxy_request(provider, "completions", "POST", body, upstream_model)
-    return Response(content=resp_body, status_code=status, headers=resp_headers)
-
-
-# Catch-all: forward any /v1/... or /... path
-@app.api_route("/{path:path}", methods=["GET", "POST", "PUT", "DELETE", "PATCH"])
-async def catch_all_proxy(
-    request: Request,
-    path: str,
-    authorization: str | None = Header(None),
-):
-    """
-    Catch-all proxy: forward unrecognized paths to the first configured provider.
-    Useful for endpoints we haven't explicitly defined.
-    """
-    _check_api_key(authorization)
-    if path.startswith("admin"):
-        raise HTTPException(status_code=404, detail=f"Admin endpoint '/{path}' not found")
-
-    body = await request.body()
-    payload = {}
-    try:
-        payload = json.loads(body) if body else {}
-    except json.JSONDecodeError:
-        pass
-
-    model = payload.get("model", "")
-    if model:
-        provider, upstream_model = _resolve_provider(config, model)
-    elif config.providers:
-        provider = config.providers[0]
-        upstream_model = provider.model_name
-    else:
-        raise HTTPException(status_code=503, detail="No providers configured")
-
-    if payload.get("stream", False):
-        return StreamingResponse(
-            _proxy_request_stream(provider, path, request.method, body, upstream_model or None),
-            media_type="text/event-stream",
-        )
-    status, resp_headers, resp_body = await _proxy_request(provider, path, request.method, body, upstream_model or None)
     return Response(content=resp_body, status_code=status, headers=resp_headers)
 
 
